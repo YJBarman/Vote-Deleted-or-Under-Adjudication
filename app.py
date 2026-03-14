@@ -2,7 +2,6 @@ import os, tempfile, time
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from PIL import Image
 
 from model import load_model, classify_card
 from pdf_utils import get_total_pages, iter_page_crops
@@ -19,7 +18,6 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 #  AUTO-DETECT MODEL FROM REPO
 # ─────────────────────────────────────────────
-# Looks for any .pth file in the same folder as app.py
 def find_model_in_repo():
     app_dir = os.path.dirname(os.path.abspath(__file__))
     for f in os.listdir(app_dir):
@@ -30,7 +28,7 @@ def find_model_in_repo():
 REPO_MODEL_PATH = find_model_in_repo()
 
 # ─────────────────────────────────────────────
-#  CACHE MODEL — loads once, reused across runs
+#  CACHE MODEL
 # ─────────────────────────────────────────────
 @st.cache_resource
 def get_model(model_path):
@@ -41,36 +39,35 @@ def get_model(model_path):
 # ─────────────────────────────────────────────
 st.sidebar.title("⚙️ Settings")
 
-# ── Model section ──
+# ── Model ──
 st.sidebar.subheader("🤖 Model")
 if REPO_MODEL_PATH:
-    model_name = os.path.basename(REPO_MODEL_PATH)
+    model_name   = os.path.basename(REPO_MODEL_PATH)
     st.sidebar.success(f"✅ Auto-loaded: **{model_name}**")
     model_file   = None
     model_ready  = True
     model_source = REPO_MODEL_PATH
 else:
     st.sidebar.warning("⚠️ No .pth found in repo — upload manually")
-    model_file  = st.sidebar.file_uploader(
+    model_file   = st.sidebar.file_uploader(
         "Upload trained model (.pth)", type=["pth"]
     )
     model_ready  = model_file is not None
-    model_source = None   # will be set after upload
+    model_source = None
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("📐 Grid Settings")
-cols      = st.sidebar.number_input("Columns",      value=3,   min_value=1, max_value=10)
-rows      = st.sidebar.number_input("Rows",         value=10,  min_value=1, max_value=20)
-dpi       = st.sidebar.number_input("DPI",          value=300, min_value=72, max_value=600)
-header_px = st.sidebar.number_input("Header px",    value=120, min_value=0)
-footer_px = st.sidebar.number_input("Footer px",    value=110, min_value=0)
-margin_l  = st.sidebar.number_input("Left margin",  value=45,  min_value=0)
-margin_r  = st.sidebar.number_input("Right margin", value=45,  min_value=0)
-
+# ── Page Range only ──
 st.sidebar.markdown("---")
 st.sidebar.subheader("📄 Page Range")
 skip_first = st.sidebar.number_input("Skip first N pages", value=2, min_value=0)
 skip_last  = st.sidebar.number_input("Skip last N pages",  value=1, min_value=0)
+
+# ── Fixed grid constants (not exposed to user) ──
+COLS      = 3
+ROWS      = 10
+HEADER_PX = 120
+FOOTER_PX = 110
+MARGIN_L  = 45
+MARGIN_R  = 45
 
 # ─────────────────────────────────────────────
 #  MAIN AREA
@@ -81,8 +78,6 @@ st.markdown(
     "**Active**, **Deleted**, **Adjudication**, or **Empty**."
 )
 
-pdf_file = st.file_uploader("📄 Upload Voter Roll PDF", type=["pdf"])
-
 CLASS_COLORS = {
     "active"      : "#4CAF50",
     "deleted"     : "#F44336",
@@ -90,31 +85,50 @@ CLASS_COLORS = {
     "empty"       : "#9E9E9E",
 }
 
+# ── File uploader ──
+pdf_file = st.file_uploader("📄 Upload Voter Roll PDF", type=["pdf"])
+
+# ── Store PDF bytes in session state immediately on upload ──
+if pdf_file is not None:
+    st.session_state["pdf_bytes"] = pdf_file.read()
+    st.session_state["pdf_name"]  = pdf_file.name
+
+pdf_ready = "pdf_bytes" in st.session_state
+
+# ── Show loaded file + clear button ──
+if pdf_ready:
+    col_info, col_clear = st.columns([5, 1])
+    col_info.success(f"📄 Ready: **{st.session_state['pdf_name']}**")
+    if col_clear.button("🗑️ Clear"):
+        del st.session_state["pdf_bytes"]
+        del st.session_state["pdf_name"]
+        if "df" in st.session_state:
+            del st.session_state["df"]
+        st.rerun()
+
 # ─────────────────────────────────────────────
 #  RUN INFERENCE
 # ─────────────────────────────────────────────
 if st.button("🚀 Run Classification",
-             disabled=(pdf_file is None or not model_ready)):
+             disabled=(not pdf_ready or not model_ready)):
+
+    # ── Save PDF from session state to temp file ──
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+        f.write(st.session_state["pdf_bytes"])
+        pdf_path = f.name
 
     # ── Resolve model path ──
     if model_source:
-        # Auto-detected from repo — use directly, no temp file needed
         final_model_path = model_source
         cleanup_model    = False
     else:
-        # Manually uploaded — save to temp file
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pth")
         tmp.write(model_file.read())
         tmp.close()
         final_model_path = tmp.name
         cleanup_model    = True
 
-    # ── Save PDF to temp file ──
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
-        f.write(pdf_file.read())
-        pdf_path = f.name
-
-    # ── Load model (cached after first run) ──
+    # ── Load model (cached) ──
     with st.spinner("Loading model..."):
         model, class_names, idx_to_class = get_model(final_model_path)
     st.success(f"✅ Model loaded  |  Classes: {class_names}")
@@ -123,7 +137,7 @@ if st.button("🚀 Run Classification",
     total_pages = get_total_pages(pdf_path)
     first_page  = skip_first + 1
     last_page   = total_pages - skip_last
-    total_cards = (last_page - first_page + 1) * cols * rows
+    total_cards = (last_page - first_page + 1) * COLS * ROWS
 
     st.info(
         f"📄 PDF has **{total_pages}** pages  |  "
@@ -140,7 +154,7 @@ if st.button("🚀 Run Classification",
 
     for page_num, c_idx, crop_pil in iter_page_crops(
         pdf_path, first_page, last_page,
-        cols, rows, header_px, footer_px, margin_l, margin_r
+        COLS, ROWS, HEADER_PX, FOOTER_PX, MARGIN_L, MARGIN_R
     ):
         pred, conf, probs, raw, fallback = classify_card(
             crop_pil, model, idx_to_class
@@ -148,8 +162,8 @@ if st.button("🚀 Run Classification",
         records.append({
             "page"              : page_num,
             "card_idx"          : c_idx,
-            "row"               : c_idx // cols + 1,
-            "col"               : c_idx % cols + 1,
+            "row"               : c_idx // COLS + 1,
+            "col"               : c_idx % COLS + 1,
             "prediction"        : pred,
             "raw_prediction"    : raw,
             "confidence"        : conf,
@@ -227,18 +241,19 @@ if "df" in st.session_state:
 
     with col3:
         st.subheader("📄 Cards per Page")
-        pivot = df.groupby(["page","prediction"]).size().reset_index(name="count")
+        pivot = df.groupby(["page", "prediction"]).size().reset_index(name="count")
         fig_bar = px.bar(
             pivot, x="page", y="count", color="prediction",
             color_discrete_map=CLASS_COLORS, barmode="stack"
         )
+        fig_bar.update_layout(xaxis_title="Page", yaxis_title="Cards")
         st.plotly_chart(fig_bar, use_container_width=True)
 
     # ── Heatmap ──
     st.subheader("🔥 Deleted Cards Heatmap (Page × Row)")
     deleted_df = df[df["prediction"] == "deleted"]
     if len(deleted_df) > 0:
-        heat_data = deleted_df.groupby(["page","row"]).size().reset_index(name="count")
+        heat_data = deleted_df.groupby(["page", "row"]).size().reset_index(name="count")
         fig_heat  = px.density_heatmap(
             heat_data, x="page", y="row", z="count",
             color_continuous_scale="Reds"
@@ -255,8 +270,8 @@ if "df" in st.session_state:
             f"⚠️ {len(fallbacks)} card(s) reassigned to active due to low confidence"
         )
         st.dataframe(
-            fallbacks[["page","card_idx","row","col",
-                        "raw_prediction","confidence",
+            fallbacks[["page", "card_idx", "row", "col",
+                        "raw_prediction", "confidence",
                         *[f"prob_{c}" for c in class_names]]],
             use_container_width=True
         )
